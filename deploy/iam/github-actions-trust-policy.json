@@ -12,8 +12,8 @@
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": [
-            "repo:Aateesh/bank_customer_acquisition_xgboost_v2:ref:refs/heads/main",
-            "repo:Aateesh/bank_customer_acquisition_xgboost_v2:environment:production"
+            "repo:Aateesh@127016129/bank_customer_acquisition_xgboost_v2@1451293122:ref:refs/heads/main",
+            "repo:Aateesh@127016129/bank_customer_acquisition_xgboost_v2@1451293122:environment:production"
           ]
         }
       }

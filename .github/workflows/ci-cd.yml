@@ -77,11 +77,11 @@ jobs:
       - name: Lint Python (ruff, error-level rules)
         run: ruff check --output-format=github .
 
-      - name: Lint deploy script (shellcheck)
-        run: shellcheck deploy/ec2_deploy.sh
+      - name: Lint shell scripts (shellcheck)
+        run: shellcheck deploy/ec2_deploy.sh .github/scripts/*.sh
 
       - name: Byte-compile
-        run: python -m compileall -q src run_pipeline.py
+        run: python -m compileall -q src tests run_pipeline.py
 
       - name: Unit tests
         run: pytest -v
@@ -166,13 +166,26 @@ jobs:
             "$ECR_REPOSITORY:ci" -m src.preflight | tee "$RUNNER_TEMP/preflight.log"
           grep -q "PREFLIGHT PASSED" "$RUNNER_TEMP/preflight.log"
 
+      - name: Check required repository variables
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: bash .github/scripts/check_aws_vars.sh
+
       - name: Configure AWS credentials (OIDC)
+        id: aws
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           role-session-name: gha-build-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Explain OIDC failure
+        if: failure() && steps.aws.outcome == 'failure'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: bash .github/scripts/explain_oidc_failure.sh
 
       - name: Push to ECR (sha-<commit> + latest)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -231,12 +244,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check required repository variables
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: bash .github/scripts/check_aws_vars.sh --deploy
+
       - name: Configure AWS credentials (OIDC)
+        id: aws
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           role-session-name: gha-deploy-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Explain OIDC failure
+        if: failure() && steps.aws.outcome == 'failure'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: bash .github/scripts/explain_oidc_failure.sh
 
       - name: Resolve image to deploy
         id: image
@@ -263,10 +289,6 @@ jobs:
           IMAGE_URI: ${{ steps.image.outputs.uri }}
           TAG: ${{ steps.image.outputs.tag }}
         run: |
-          if [[ -z "$INSTANCE_ID" ]]; then
-            echo "::error::Repository variable EC2_INSTANCE_ID is not set"; exit 1
-          fi
-
           # Ship the deploy script inside the SSM command (no SSH, no extra S3 object).
           script_b64="$(base64 -w0 deploy/ec2_deploy.sh)"
           params="$(jq -n --arg b64 "$script_b64" --arg image "$IMAGE_URI" '{

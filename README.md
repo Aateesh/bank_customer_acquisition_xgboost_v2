@@ -217,40 +217,60 @@ The container reads these environment variables (see `src/config.py`;
 
 GitHub repository **variables** (not secrets, because they hold no credentials):
 
-| Variable | Example |
+| Variable | Value for this project |
 |---|---|
-| `AWS_ROLE_ARN` | `arn:aws:iam::<account>:role/github-actions-bank-ml-deploy` |
-| `EC2_INSTANCE_ID` | `i-0123456789abcdef0` |
+| `AWS_ROLE_ARN` | `arn:aws:iam::511680076954:role/github-actions-bank-ml-deploy` |
+| `EC2_INSTANCE_ID` | `i-0ffdb8b7cab4101cc` |
+
+No GitHub **secrets** are needed. If `AWS_ROLE_ARN` is missing, `configure-aws-credentials`
+has no role to assume and fails with "Could not load credentials from any providers".
+The workflow therefore checks both variables first and stops with
+`AWS_ROLE_ARN repository variable is missing`.
 
 ---
 
 ## One-time AWS setup
 
-Run these with an administrator profile. Replace `i-XXXXXXXX` with the instance ID.
+Run these from the repo root with an **administrator** profile. The pipeline's
+`marketing-ml-poc-user` can't read IAM, EC2 or SSM. Every step is safe to re-run: it
+updates what exists and creates only what is missing. Nothing is deleted.
 
 ```bash
-export AWS_REGION=eu-north-1 ACCOUNT=511680076954 INSTANCE_ID=i-XXXXXXXX
+export AWS_REGION=eu-north-1 ACCOUNT=511680076954 INSTANCE_ID=i-0ffdb8b7cab4101cc
+export MSYS_NO_PATHCONV=1   # Git Bash on Windows: stop it rewriting /bank-ml/prod into C:/Program Files/Git/...
 REPO=bank-customer-acquisition-ml
+GHA_ROLE=github-actions-bank-ml-deploy
+EC2_ROLE=marketing-ml-poc-ec2-role
 
-# 1. GitHub OIDC provider (once per AWS account; skip if it already exists)
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com
+# 1. GitHub OIDC provider (once per AWS account). Look first, create only if absent.
+aws iam list-open-id-connect-providers --output text | grep -q token.actions.githubusercontent.com \
+  || aws iam create-open-id-connect-provider \
+       --url https://token.actions.githubusercontent.com \
+       --client-id-list sts.amazonaws.com
 
-# 2. Role assumed by GitHub Actions (main branch + "production" environment only)
-sed "s/REPLACE_WITH_EC2_INSTANCE_ID/$INSTANCE_ID/" deploy/iam/github-actions-permissions-policy.json > /tmp/gha-policy.json
-aws iam create-role --role-name github-actions-bank-ml-deploy \
-  --assume-role-policy-document file://deploy/iam/github-actions-trust-policy.json
-aws iam put-role-policy --role-name github-actions-bank-ml-deploy \
-  --policy-name ecr-push-ssm-deploy \
-  --policy-document file:///tmp/gha-policy.json
+# 2. Role assumed by GitHub Actions (main branch + "production" environment only).
+#    If the role already exists, only its trust policy is replaced.
+#    This repository uses GitHub *immutable* OIDC subject claims, so tokens carry
+#      repo:Aateesh@127016129/bank_customer_acquisition_xgboost_v2@1451293122:ref:refs/heads/main
+#    (owner@owner_id/repo@repo_id), NOT repo:Aateesh/bank_customer_acquisition_xgboost_v2:...
+#    A trust policy using the short form fails with "Not authorized to perform
+#    sts:AssumeRoleWithWebIdentity". Check the format with:
+#      curl -s https://api.github.com/repos/Aateesh/bank_customer_acquisition_xgboost_v2/actions/oidc/customization/sub
+if aws iam get-role --role-name $GHA_ROLE >/dev/null 2>&1; then
+  aws iam update-assume-role-policy --role-name $GHA_ROLE \
+    --policy-document file://deploy/iam/github-actions-trust-policy.json
+else
+  aws iam create-role --role-name $GHA_ROLE \
+    --assume-role-policy-document file://deploy/iam/github-actions-trust-policy.json
+fi
+aws iam put-role-policy --role-name $GHA_ROLE --policy-name ecr-push-ssm-deploy \
+  --policy-document file://deploy/iam/github-actions-permissions-policy.json
+aws iam get-role --role-name $GHA_ROLE --query Role.Arn --output text   # -> value for AWS_ROLE_ARN
 
 # 3. EC2 instance role: SSM agent access, ECR pull, read runtime config.
-#    The role's existing S3 permissions are left as they are.
-PROFILE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-  --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text | cut -d/ -f2)
-EC2_ROLE=$(aws iam get-instance-profile --instance-profile-name $PROFILE \
-  --query 'InstanceProfile.Roles[0].RoleName' --output text)
+#    The role's existing S3 permissions are left as they are. Confirm it is the attached role:
+aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+  --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text
 aws iam attach-role-policy --role-name $EC2_ROLE --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam attach-role-policy --role-name $EC2_ROLE --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
 aws iam put-role-policy --role-name $EC2_ROLE --policy-name bank-ml-runtime-config \
