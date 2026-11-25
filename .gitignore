@@ -1,0 +1,84 @@
+# =========================================================
+# Environment / Secrets
+# =========================================================
+.env
+*.env
+config/.env
+
+!.env.example
+!config/.env.example
+
+# =========================================================
+# Python
+# =========================================================
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# =========================================================
+# Virtual environments
+# =========================================================
+.venv/
+venv/
+env/
+
+# =========================================================
+# IDE
+# =========================================================
+.vscode/
+.idea/
+
+# =========================================================
+# Logs
+# =========================================================
+*.log
+logs/
+airflow/logs/
+
+# =========================================================
+# Generated / temporary data
+# =========================================================
+data/*
+
+# Keep only the two intentional input datasets
+!data/customer_acquisition_scoring_data.csv
+!data/customer_acquisition_test_data.csv
+
+# Explicit generated artifacts
+bank_customer_acquisition_150k.csv
+campaign_scored_customers.csv
+data_dictionary.csv
+feature_importance.csv
+python_to_pyspark_mapping.md
+sample_1000_rows.csv
+
+# Generated Spark files
+data/processed_staging/
+data/s3_staging/
+
+# Generated model outputs
+data/customer_acquisition_predictions.csv
+data/customer_marketing_data.csv
+data/customer_marketing_data_from_s3.parquet
+data/customer_marketing_data_processed_v1.parquet
+data/model_metrics.json
+data/s3_output_test.csv
+
+# =========================================================
+# Airflow
+# =========================================================
+airflow/logs/
+airflow/**/__pycache__/
+
+# =========================================================
+# OS
+# =========================================================
+.DS_Store
+Thumbs.db

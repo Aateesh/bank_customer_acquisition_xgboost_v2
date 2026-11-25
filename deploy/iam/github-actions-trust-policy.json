@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GitHubActionsOIDCMainBranchAndProductionEnvironment",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::511680076954:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:Aateesh/bank_customer_acquisition_xgboost_v2:ref:refs/heads/main",
+            "repo:Aateesh/bank_customer_acquisition_xgboost_v2:environment:production"
+          ]
+        }
+      }
+    }
+  ]
+}

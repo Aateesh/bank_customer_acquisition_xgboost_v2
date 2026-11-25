@@ -1,0 +1,323 @@
+# =====================================================================
+# CI/CD for the batch ML pipeline
+#
+#   pull_request -> main : test + Docker build/validate          (no AWS access)
+#   push         -> main : test + build/validate + push to ECR + deploy to EC2
+#   workflow_dispatch    : image_tag empty  -> same as push (rebuild + deploy)
+#                          image_tag=sha-.. -> redeploy/rollback that ECR image
+#
+# Deployment = pull + preflight-verify + promote the image on EC2.
+# It does NOT execute run_pipeline.py (batch execution is separate; see README).
+#
+# Required repository variables (Settings -> Secrets and variables -> Variables):
+#   AWS_ROLE_ARN     IAM role assumed via GitHub OIDC (no static AWS keys)
+#   EC2_INSTANCE_ID  SSM-managed instance that runs the batch container
+# =====================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Rollback / redeploy an existing ECR tag (sha-<commit>). Leave empty to build and deploy this commit."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: bank-customer-acquisition-ml
+  PYTHON_VERSION: "3.13"
+
+defaults:
+  run:
+    shell: bash   # bash -eo pipefail
+
+jobs:
+  # -------------------------------------------------------------------
+  # CI 1: lint + unit tests (dummy config, no cloud access)
+  # -------------------------------------------------------------------
+  test:
+    name: Lint & unit tests
+    if: ${{ !inputs.image_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Set up Java 17 (PySpark)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint Python (ruff, error-level rules)
+        run: ruff check --output-format=github .
+
+      - name: Lint deploy script (shellcheck)
+        run: shellcheck deploy/ec2_deploy.sh
+
+      - name: Byte-compile
+        run: python -m compileall -q src run_pipeline.py
+
+      - name: Unit tests
+        run: pytest -v
+
+  # -------------------------------------------------------------------
+  # CI 2: Docker build + validation; CD 1: push immutable tag to ECR
+  # -------------------------------------------------------------------
+  build:
+    name: Docker build & validate${{ github.event_name != 'pull_request' && ' & push to ECR' || '' }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write   # GitHub OIDC -> AWS (used only off pull requests)
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.ECR_REPOSITORY }}:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Validate image - default command is the batch pipeline
+        run: |
+          cmd="$(docker inspect -f '{{json .Config.Cmd}}' "$ECR_REPOSITORY:ci")"
+          echo "CMD: $cmd"
+          test "$cmd" = '["python","run_pipeline.py"]'
+
+      - name: Validate image - no secrets baked in
+        run: |
+          docker run --rm --entrypoint sh "$ECR_REPOSITORY:ci" -c '
+            if [ -e /app/config/.env ]; then echo "config/.env present in image"; exit 1; fi
+            if env | grep -qE "^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|SNOWFLAKE_PASSWORD)="; then
+              echo "secret environment variable baked into image"; exit 1
+            fi
+            if grep -rIqE "AKIA[0-9A-Z]{16}" /app/src /app/config /app/run_pipeline.py; then
+              echo "AWS access key pattern found in image"; exit 1
+            fi
+            echo "no secrets found in image"
+          '
+
+      - name: Validate image - offline preflight (dummy config)
+        run: |
+          cat > "$RUNNER_TEMP/ci.env" <<'EOF'
+          AWS_REGION=eu-north-1
+          S3_BUCKET_NAME=ci-dummy-bucket
+          S3_INPUT_PREFIX=input/
+          S3_PROCESSED_PREFIX=processed/
+          S3_OUTPUT_PREFIX=output/
+          S3_INPUT_FILE=customer_acquisition_scoring_data.parquet
+          S3_PROCESSED_FILE=customer_acquisition_features.csv
+          S3_OUTPUT_FILE=customer_acquisition_predictions.csv
+          SNOWFLAKE_ACCOUNT=ci-dummy
+          SNOWFLAKE_USER=ci-dummy
+          SNOWFLAKE_PASSWORD=ci-dummy
+          SNOWFLAKE_WAREHOUSE=ci-dummy
+          SNOWFLAKE_DATABASE=ci-dummy
+          SNOWFLAKE_SCHEMA=ci-dummy
+          SNOWFLAKE_ROLE=ci-dummy
+          SNOWFLAKE_TABLE=ci-dummy
+          SOURCE_DATA_FILE=data/customer_acquisition_scoring_data.csv
+          MODEL_FILE=xgb_customer_acquisition_pipeline.joblib
+          LOCAL_PROCESSED_FILE=customer_acquisition_features.csv
+          EOF
+          docker run --rm --env-file "$RUNNER_TEMP/ci.env" --entrypoint python \
+            "$ECR_REPOSITORY:ci" -m src.preflight | tee "$RUNNER_TEMP/preflight.log"
+          grep -q "PREFLIGHT PASSED" "$RUNNER_TEMP/preflight.log"
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-build-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push to ECR (sha-<commit> + latest)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          account="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$account"
+          registry="$account.dkr.ecr.$AWS_REGION.amazonaws.com"
+          image="$registry/$ECR_REPOSITORY"
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            # Immutable tags are never overwritten (e.g. on a workflow re-run).
+            echo "$TAG already exists in ECR; not overwriting."
+          else
+            docker tag "$ECR_REPOSITORY:ci" "$image:$TAG"
+            docker push "$image:$TAG"
+            docker tag "$ECR_REPOSITORY:ci" "$image:latest"
+            docker push "$image:latest"
+          fi
+
+          digest="$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                     --image-ids imageTag="$TAG" --query 'imageDetails[0].imageDigest' --output text)"
+          {
+            echo "### Image pushed to ECR"
+            echo "- Repository: \`$ECR_REPOSITORY\`"
+            echo "- Tag: \`$TAG\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------
+  # CD 2: deploy to EC2 through SSM Run Command (no SSH)
+  # -------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2 (SSM)
+    needs: build
+    if: >-
+      !cancelled()
+      && github.ref == 'refs/heads/main'
+      && github.event_name != 'pull_request'
+      && (needs.build.result == 'success'
+          || (github.event_name == 'workflow_dispatch' && inputs.image_tag != '' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve image to deploy
+        id: image
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+          BUILT_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          tag="${INPUT_TAG:-$BUILT_TAG}"
+          if [[ ! "$tag" =~ ^sha-[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Refusing to deploy tag '$tag' (expected sha-<commit>)"; exit 1
+          fi
+          account="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$account"
+          if ! aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                 --image-ids imageTag="$tag" >/dev/null 2>&1; then
+            echo "::error::Image tag $tag not found in ECR repository $ECR_REPOSITORY"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "uri=$account.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via SSM Run Command
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          if [[ -z "$INSTANCE_ID" ]]; then
+            echo "::error::Repository variable EC2_INSTANCE_ID is not set"; exit 1
+          fi
+
+          # Ship the deploy script inside the SSM command (no SSH, no extra S3 object).
+          script_b64="$(base64 -w0 deploy/ec2_deploy.sh)"
+          params="$(jq -n --arg b64 "$script_b64" --arg image "$IMAGE_URI" '{
+            commands: [
+              "f=$(mktemp /tmp/ec2_deploy.XXXXXX)",
+              ("echo " + $b64 + " | base64 -d > \"$f\""),
+              ("bash \"$f\" deploy " + $image + "; rc=$?; rm -f \"$f\"; exit $rc")
+            ],
+            executionTimeout: ["1800"]
+          }')"
+
+          command_id="$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy $TAG (run $GITHUB_RUN_ID)" \
+            --parameters "$params" \
+            --timeout-seconds 600 \
+            --query Command.CommandId --output text)"
+          echo "SSM command id: $command_id"
+
+          status=Pending
+          for _ in $(seq 1 180); do   # up to 30 minutes
+            sleep 10
+            status="$(aws ssm get-command-invocation --command-id "$command_id" \
+                       --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)"
+            case "$status" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            echo "status: $status"
+          done
+
+          echo "::group::EC2 deployment output"
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+          echo "::endgroup::"
+          echo "::group::EC2 deployment stderr"
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query StandardErrorContent --output text || true
+          echo "::endgroup::"
+
+          {
+            echo "### EC2 deployment: $status"
+            echo "- Image tag: \`$TAG\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- SSM command: \`$command_id\`"
+            if [[ "$status" != "Success" ]]; then
+              echo "- EC2 was left on its previous image (the new image was not promoted)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$status" != "Success" ]]; then
+            echo "::error::Deployment $status. EC2 remains on its previous image."
+            exit 1
+          fi

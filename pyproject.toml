@@ -1,0 +1,15 @@
+# Tool configuration only (the project is not an installable package).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py313"
+extend-exclude = ["spark_tmp", "airflow/logs"]
+
+[tool.ruff.lint]
+# Errors only: syntax errors, undefined names, invalid comparisons.
+# Deliberately no style rules, so CI never forces reformatting of the
+# existing, working ML pipeline code.
+select = ["E9", "F63", "F7", "F82"]

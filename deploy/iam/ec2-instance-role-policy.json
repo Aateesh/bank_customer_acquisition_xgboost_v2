@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadPipelineRuntimeConfiguration",
+      "Effect": "Allow",
+      "Action": "ssm:GetParametersByPath",
+      "Resource": [
+        "arn:aws:ssm:eu-north-1:511680076954:parameter/bank-ml/prod",
+        "arn:aws:ssm:eu-north-1:511680076954:parameter/bank-ml/prod/*"
+      ]
+    },
+    {
+      "Sid": "DecryptSecureStringsViaSsmOnly",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.eu-north-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

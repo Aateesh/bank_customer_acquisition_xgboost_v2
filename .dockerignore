@@ -1,0 +1,30 @@
+# Secrets: never in the build context or the image
+.env
+*.env
+.env.*
+config/.env
+
+# Python / tooling
+.venv/
+venv/
+**/__pycache__
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Not needed at runtime
+.git/
+.gitignore
+.github/
+.vscode/
+tests/
+deploy/
+airflow/
+logs/
+spark_tmp/
+
+# Generated / staged data (lives in S3)
+data/s3_staging/
+data/processed_staging/
+data/spark_warehouse/
+data/spark_processed/
